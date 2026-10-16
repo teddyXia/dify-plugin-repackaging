@@ -1,90 +1,170 @@
-name: Repackage Dify Plugin
+
+name: Repackage Dify Plugin Offline
 
 on:
   workflow_dispatch:
     inputs:
       plugin_author:
-        description: "plugin author"
+        description: "Plugin author"
         required: true
         type: string
+        default: "langgenius"
+
       plugin_name:
-        description: "plugin name"
+        description: "Plugin name"
         required: true
         type: string
+        default: "openai_api_compatible"
+
       plugin_version:
-        description: "plugin version"
+        description: "Plugin version"
         required: true
         type: string
+        default: "0.0.53"
+
       platform_arm:
-        description: "Use ARM platform (true = manylinux_2_28_aarch64, false = manylinux_2_17_x86_64)"
+        description: "Build ARM64 offline plugin"
         required: true
-        default: "false"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
 
 jobs:
   repackage:
-    runs-on: ${{ inputs.platform_arm == 'true' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    name: Repackage Plugin
+    runs-on: ${{ inputs.platform_arm && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 120
+
     steps:
-      - name: Print workflow inputs
-        run: |
-          echo "plugin_author  = ${{ inputs.plugin_author }}"
-          echo "plugin_name    = ${{ inputs.plugin_name }}"
-          echo "plugin_version = ${{ inputs.plugin_version }}"
-          echo "platform_arm   = ${{ inputs.platform_arm }}"
-
-      - name: Resolve platform
-        run: |
-          if [ "${{ inputs.platform_arm }}" = "true" ]; then
-            echo "TARGET_PLATFORM=manylinux_2_28_aarch64" >> "$GITHUB_ENV"
-            echo "PACKAGE_SUFFIX=offline-arm" >> "$GITHUB_ENV"
-          else
-            echo "TARGET_PLATFORM=manylinux_2_17_x86_64" >> "$GITHUB_ENV"
-            echo "PACKAGE_SUFFIX=offline" >> "$GITHUB_ENV"
-          fi
-
-      - name: Checkout repository
+      # 检出支持 uv 离线安装的增强版工具
+      - name: Checkout repackaging tool
         uses: actions/checkout@v4
+        with:
+          repository: xjl456852/dify-plugin-repackaging-plus
+          ref: main
+          path: packer
 
-      - name: Set up Python 3.12
+      # 安装 Python 3.12
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Verify runner architecture
-        run: uname -m
+      # 安装 uv
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
 
-      - name: Install native wheel build dependencies
-        if: inputs.platform_arm == 'true'
+      # 安装基础工具
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential python3-dev rustc cargo
+          sudo apt-get install -y \
+            curl \
+            unzip \
+            coreutils
 
-      - name: Make plugin_repackaging.sh executable
-        run: chmod +x ./plugin_repackaging.sh
-
-      - name: Run plugin repackaging script
+      # 检查实际运行环境
+      - name: Verify build environment
         run: |
-          PIP_MIRROR_URL=https://pypi.org/simple \
-          ./plugin_repackaging.sh \
-          -p ${{ env.TARGET_PLATFORM }} \
-          -s ${{ env.PACKAGE_SUFFIX }} \
-          market \
-          "${{ github.event.inputs.plugin_author }}" \
-          "${{ github.event.inputs.plugin_name }}" \
-          "${{ github.event.inputs.plugin_version }}"
+          echo "Architecture:"
+          uname -m
 
-      - name: Find repackaged artifact
+          echo "Python:"
+          python --version
+
+          echo "pip:"
+          python -m pip --version
+
+          echo "uv:"
+          uv --version
+
+          echo "Repackaging tool:"
+          ls -lh packer/plugin_repackaging.sh
+          ls -lh packer/dify-plugin-linux-*-5g
+
+          chmod +x packer/plugin_repackaging.sh
+
+      # 下载 Marketplace 插件并离线打包
+      - name: Repackage plugin
+        working-directory: packer
+        env:
+          PLUGIN_AUTHOR: ${{ inputs.plugin_author }}
+          PLUGIN_NAME: ${{ inputs.plugin_name }}
+          PLUGIN_VERSION: ${{ inputs.plugin_version }}
+          PIP_MIRROR_URL: https://pypi.org/simple
+          DIFY_PIP_COMMAND: python -m pip
         run: |
-          ARTIFACT_PATH=$(find . -type f -name "*-${PACKAGE_SUFFIX}.difypkg" | head -n 1)
-          if [ -z "$ARTIFACT_PATH" ]; then
-            echo "No *-${PACKAGE_SUFFIX}.difypkg artifact found!"
+          set -euo pipefail
+
+          bash ./plugin_repackaging.sh \
+            market \
+            "$PLUGIN_AUTHOR" \
+            "$PLUGIN_NAME" \
+            "$PLUGIN_VERSION"
+
+      # 验证离线包结构
+      - name: Verify offline package
+        working-directory: packer
+        env:
+          PLUGIN_AUTHOR: ${{ inputs.plugin_author }}
+          PLUGIN_NAME: ${{ inputs.plugin_name }}
+          PLUGIN_VERSION: ${{ inputs.plugin_version }}
+        run: |
+          set -euo pipefail
+
+          PKG="${PLUGIN_AUTHOR}-${PLUGIN_NAME}_${PLUGIN_VERSION}-offline.difypkg"
+
+          if [ ! -s "$PKG" ]; then
+            echo "ERROR: Offline package not found"
             exit 1
           fi
-      
-          echo "ARTIFACT_PATH=$ARTIFACT_PATH" >> $GITHUB_ENV
-          echo "ARTIFACT_NAME=$(basename "$ARTIFACT_PATH")" >> $GITHUB_ENV
 
-      - name: Upload artifact
+          unzip -t "$PKG" > /dev/null
+
+          CONTENTS=$(unzip -Z1 "$PKG")
+
+          # 必须包含 uv.toml
+          if ! grep -qx "uv.toml" <<< "$CONTENTS"; then
+            echo "ERROR: uv.toml missing"
+            exit 1
+          fi
+
+          # 不应该包含 uv.lock
+          if grep -qx "uv.lock" <<< "$CONTENTS"; then
+            echo "ERROR: uv.lock still exists"
+            exit 1
+          fi
+
+          # 必须包含 requirements.txt
+          if ! grep -qx "requirements.txt" <<< "$CONTENTS"; then
+            echo "ERROR: requirements.txt missing"
+            exit 1
+          fi
+
+          # 必须包含 wheel 文件
+          if ! grep -Eq '^wheels/.*\.whl$' <<< "$CONTENTS"; then
+            echo "ERROR: No wheel files found"
+            exit 1
+          fi
+
+          # 校验 uv 离线模式
+          unzip -p "$PKG" uv.toml | grep -q '^offline = true$'
+
+          echo "Offline package validation passed!"
+          echo "Architecture: $(uname -m)"
+          echo "Package: $PKG"
+
+          echo "ARTIFACT_PATH=packer/$PKG" >> "$GITHUB_ENV"
+          echo "ARTIFACT_NAME=${PLUGIN_AUTHOR}-${PLUGIN_NAME}_${PLUGIN_VERSION}-$(uname -m)-offline" >> "$GITHUB_ENV"
+
+      # 上传验证通过的插件包
+      - name: Upload offline plugin
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT_NAME }}
           path: ${{ env.ARTIFACT_PATH }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
